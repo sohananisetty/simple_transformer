@@ -6,11 +6,11 @@ from enum import Enum
 
 
 class PositionalEmbeddingType(Enum):
-    REL = "core.models.positional_embeddings.RelativePositionBias"
-    SINE = "core.models.positional_embeddings.ScaledSinusoidalEmbedding"
-    ALIBI = "core.models.positional_embeddings.AlibiPositionalBias"
-    ABS = "core.models.positional_embeddings.AbsolutePositionalEmbedding"
-    SHAW = "core.models.positional_embeddings.ShawRelativePositionalEmbedding"
+    REL = "positional_embeddings.RelativePositionBias"
+    SINE = "positional_embeddings.ScaledSinusoidalEmbedding"
+    ALIBI = "positional_embeddings.AlibiPositionalBias"
+    ABS = "positional_embeddings.AbsolutePositionalEmbedding"
+    SHAW = "positional_embeddings.ShawRelativePositionalEmbedding"
 
 
 @dataclass
