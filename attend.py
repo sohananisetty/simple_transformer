@@ -17,7 +17,7 @@ from einops import rearrange, repeat
 from packaging import version
 from torch import einsum, nn
 
-from dataclasses import AttentionParams
+from .params import AttentionParams
 
 
 class Attend(nn.Module):

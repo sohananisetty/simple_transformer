@@ -1,14 +1,12 @@
 import math
-from dataclasses import dataclass
-from enum import Enum
+
 
 import torch
 import torch.nn.functional as F
 from utils import exists, pad_at_dim
 from einops import rearrange, repeat
 from torch import einsum, nn
-from dataclasses import PositionalEmbeddingParams
-from functools import partial
+from .params import PositionalEmbeddingParams
 
 
 class ShawRelativePositionalEmbedding(nn.Module):

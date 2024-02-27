@@ -1,7 +1,4 @@
 from dataclasses import dataclass
-import torch
-from typing import List, Dict
-from functools import partial
 from enum import Enum
 
 
@@ -41,9 +38,10 @@ class PositionalEmbeddingParams:
 
 @dataclass
 class TransformerParams:
-    attention_params: AttentionParams
+    self_attention_params: AttentionParams
+    cross_attention_params: AttentionParams = None
     positional_embedding_params: PositionalEmbeddingParams = None
-    positional_embedding: PositionalEmbeddingType = None
+    positional_embedding: PositionalEmbeddingType = PositionalEmbeddingType.SINE
 
     num_tokens: int = 1024
     dim_out: int = None
