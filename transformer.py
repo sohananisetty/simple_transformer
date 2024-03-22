@@ -1,84 +1,182 @@
 import torch
 import torch.nn.functional as F
-from attend import Attention
+from attend import CustomMHA
 from .params import (
-    AttentionParams,
     TransformerParams,
     PositionalEmbeddingParams,
     PositionalEmbeddingType,
 )
-from utils import default, exists, get_obj_from_str, LayerNorm, prob_mask_like
+from utils import default, exists, get_obj_from_str, prob_mask_like
 from einops import rearrange, repeat
 from torch import einsum, nn
 from tqdm.auto import tqdm
 
 
-class GEGLU(nn.Module):
-    """https://arxiv.org/abs/2002.05202"""
+class LayerNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(dim))
+        self.register_buffer("beta", torch.zeros(dim))
 
     def forward(self, x):
-        x, gate = x.chunk(2, dim=-1)
-        return gate * F.gelu(x)
+        return F.layer_norm(x, x.shape[-1:], self.gamma, self.beta)
 
 
-def FeedForward(dim, mult=4):
+def FeedForward(
+    dim,
+    mult=4,
+    dropout=0.1,
+):
     """https://arxiv.org/abs/2110.09456"""
 
-    inner_dim = int(dim * mult * 2 / 3)
+    inner_dim = int(dim * mult)
     return nn.Sequential(
-        LayerNorm(dim),
-        nn.Linear(dim, inner_dim * 2, bias=False),
-        GEGLU(),
+        nn.Linear(dim, inner_dim, bias=False),
+        nn.GELU(),
         LayerNorm(inner_dim),
+        nn.Dropout(dropout),
         nn.Linear(inner_dim, dim, bias=False),
     )
 
 
-class TransformerBlock(nn.Module):
+class TransformerBlockCustom(nn.Module):
     def __init__(
         self,
-        self_attention_params: AttentionParams,
-        cross_attention_params: AttentionParams = None,
+        dim: int = 768,
+        heads: int = 8,
+        attn_dropout: float = 0.0,
         depth: int = 1,
         ff_mult: int = 4,
     ):
         super().__init__()
         self.layers = nn.ModuleList([])
-        self.do_cross = cross_attention_params is not None
-
-        assert cross_attention_params.dim == self_attention_params.dim, "need same dim"
 
         for _ in range(depth):
             self.layers.append(
                 nn.ModuleList(
                     [
-                        Attention(self_attention_params),
-                        (
-                            Attention(cross_attention_params)
-                            if self.do_cross
-                            else nn.Identity()
+                        CustomMHA(
+                            dim=dim,
+                            heads=heads,
+                            dropout=attn_dropout,
+                            causal=False,
+                            flash=True,
                         ),
-                        FeedForward(dim=self_attention_params.dim, mult=ff_mult),
+                        CustomMHA(
+                            dim=dim,
+                            heads=heads,
+                            dropout=attn_dropout,
+                            flash=True,
+                            causal=False,
+                        ),
+                        FeedForward(dim=dim, mult=ff_mult, dropout=attn_dropout),
                     ]
                 )
             )
 
-        self.norm = LayerNorm(self_attention_params.dim)
+        self.norm_sa = LayerNorm(dim)
+        self.norm_cross = LayerNorm(dim)
+        self.norm_out = LayerNorm(dim)
 
     def forward(self, x, mask=None, context=None, context_mask=None, rel_pos=None):
         for attn, cross_attn, ff1 in self.layers:
-            x = attn(x, mask=mask, rel_pos=rel_pos) + x
 
-            if self.do_cross:
-
-                x = (
-                    cross_attn(x, mask=mask, context=context, context_mask=context_mask)
-                    + x
+            x = self.norm_sa(x)
+            x = (
+                attn(
+                    q=x,
+                    k=x,
+                    v=x,
+                    key_padding_mask=mask,
+                    rel_pos=rel_pos,
                 )
+                + x
+            )
 
-            x = ff1(x) + x
+            x = (
+                cross_attn(
+                    q=self.norm_cross(x),
+                    k=context,
+                    v=context,
+                    key_padding_mask=context_mask,
+                )
+                + x
+            )
 
-        return self.norm(x)
+            x = self.norm_out(ff1(x) + x)
+
+        return x
+
+
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int = 768,
+        heads: int = 8,
+        attn_dropout: float = 0.0,
+        depth: int = 1,
+        ff_mult: int = 4,
+    ):
+        super().__init__()
+        self.layers = nn.ModuleList([])
+
+        for _ in range(depth):
+            self.layers.append(
+                nn.ModuleList(
+                    [
+                        nn.MultiheadAttention(
+                            embed_dim=dim,
+                            num_heads=heads,
+                            dropout=attn_dropout,
+                            bias=False,
+                            batch_first=True,
+                        ),
+                        nn.MultiheadAttention(
+                            embed_dim=dim,
+                            num_heads=heads,
+                            dropout=attn_dropout,
+                            bias=False,
+                            batch_first=True,
+                        ),
+                        FeedForward(dim=dim, mult=ff_mult, dropout=attn_dropout),
+                    ]
+                )
+            )
+
+        self.norm_sa = nn.LayerNorm(dim, eps=1e-5, bias=False)
+        self.norm_cross = nn.LayerNorm(dim, eps=1e-5, bias=False)
+        self.norm_out = nn.LayerNorm(dim, eps=1e-5, bias=False)
+
+    def forward(self, x, mask=None, context=None, context_mask=None, rel_pos=None):
+        for attn, cross_attn, ff1 in self.layers:
+
+            x = self.norm_sa(x)
+
+            x = (
+                attn(
+                    query=x,
+                    key=x,
+                    value=x,
+                    key_padding_mask=mask,
+                    need_weights=False,
+                )[0]
+                + x
+            )
+
+            x = (
+                cross_attn(
+                    query=self.norm_cross(x),
+                    key=context,
+                    value=context,
+                    key_padding_mask=context_mask,
+                    need_weights=False,
+                )[0]
+                + x
+            )
+
+            x = self.norm_out(ff1(x) + x)
+
+        return x
 
 
 class Transformer(nn.Module):
@@ -112,12 +210,12 @@ class Transformer(nn.Module):
         self.emb_dropout = nn.Dropout(transformer_params.emb_dropout)
 
         self.transformer_blocks = TransformerBlock(
-            self_attention_params=transformer_params.self_attention_params,
-            cross_attention_params=transformer_params.cross_attention_params,
+            dim=self.dim,
+            heads=transformer_params.self_attention_params.heads,
+            attn_dropout=transformer_params.self_attention_params.dropout,
             depth=transformer_params.depth,
             ff_mult=transformer_params.ff_mult,
         )
-        self.norm = LayerNorm(self.dim)
 
         self.dim_out = default(transformer_params.dim_out, self.num_tokens)
         self.to_logits = nn.Linear(self.dim, self.dim_out, bias=False)
@@ -151,54 +249,6 @@ class Transformer(nn.Module):
             context_embed,
             context_mask,
         )
-
-    def forward_with_cond_scale(
-        self, *args, cond_scale=3.0, return_embed=False, **kwargs
-    ):
-        if cond_scale == 1:
-            return self.forward(
-                *args, return_embed=return_embed, cond_drop_prob=0.0, **kwargs
-            )
-
-        logits, embed = self.forward(
-            *args, return_embed=True, cond_drop_prob=0.0, **kwargs
-        )
-
-        null_logits = self.forward(*args, cond_drop_prob=1.0, **kwargs)
-
-        scaled_logits = null_logits + (logits - null_logits) * cond_scale
-
-        if return_embed:
-            return scaled_logits, embed
-
-        return scaled_logits
-
-    def forward_with_neg_prompt(
-        self,
-        *args,
-        text_embed: torch.Tensor,
-        neg_text_embed: torch.Tensor,
-        cond_scale=3.0,
-        return_embed=False,
-        **kwargs,
-    ):
-        neg_logits = self.forward(
-            *args, neg_text_embed=neg_text_embed, cond_drop_prob=0.0, **kwargs
-        )
-        pos_logits, embed = self.forward(
-            *args,
-            return_embed=True,
-            text_embed=text_embed,
-            cond_drop_prob=0.0,
-            **kwargs,
-        )
-
-        logits = neg_logits + (pos_logits - neg_logits) * cond_scale
-
-        if return_embed:
-            return logits, embed
-
-        return logits
 
     def forward(
         self,
