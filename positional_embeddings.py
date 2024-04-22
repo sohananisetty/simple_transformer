@@ -1,20 +1,21 @@
 import math
-
+from dataclasses import dataclass
+from enum import Enum
+from functools import partial
 
 import torch
 import torch.nn.functional as F
 from utils import exists, pad_at_dim
 from einops import rearrange, repeat
 from torch import einsum, nn
-from .params import PositionalEmbeddingParams
 
 
 class ShawRelativePositionalEmbedding(nn.Module):
-    def __init__(self, params: PositionalEmbeddingParams):
+    def __init__(self, dim, max_seq_len=512):
         super().__init__()
-        self.scale = params.dim**-0.5
-        self.max_seq_len = params.max_seq_len
-        self.rel_pos_emb = nn.Embedding(2 * params.max_seq_len + 1, params.dim)
+        self.scale = dim**-0.5
+        self.max_seq_len = max_seq_len
+        self.rel_pos_emb = nn.Embedding(2 * max_seq_len + 1, dim)
 
     def forward(self, q, k):
         b, h, n, d = q.shape
@@ -27,13 +28,15 @@ class ShawRelativePositionalEmbedding(nn.Module):
 
 
 class RelativePositionBias(nn.Module):
-    def __init__(self, params: PositionalEmbeddingParams):
+    def __init__(
+        self, scale=10, causal=False, num_buckets=32, max_distance=128, heads=8
+    ):
         super().__init__()
-        self.scale = params.scale
-        self.causal = params.causal
-        self.num_buckets = params.num_buckets
-        self.max_distance = params.max_distance
-        self.relative_attention_bias = nn.Embedding(params.num_buckets, params.heads)
+        self.scale = scale
+        self.causal = causal
+        self.num_buckets = num_buckets
+        self.max_distance = max_distance
+        self.relative_attention_bias = nn.Embedding(num_buckets, heads)
 
     @staticmethod
     def _relative_position_bucket(
@@ -87,11 +90,11 @@ class RelativePositionBias(nn.Module):
 
 
 class AbsolutePositionalEmbedding(nn.Module):
-    def __init__(self, params: PositionalEmbeddingParams):
+    def __init__(self, dim, max_seq_len=512):
         super().__init__()
-        self.scale = params.dim**-0.5
-        self.max_seq_len = params.max_seq_len
-        self.emb = nn.Embedding(params.max_seq_len, params.dim)
+        self.scale = dim**-0.5
+        self.max_seq_len = max_seq_len
+        self.emb = nn.Embedding(max_seq_len, dim)
 
     def forward(self, x, pos=None):
         seq_len, device = x.shape[1], x.device
@@ -108,34 +111,37 @@ class AbsolutePositionalEmbedding(nn.Module):
 
 
 class ScaledSinusoidalEmbedding(nn.Module):
-    def __init__(self, params: PositionalEmbeddingParams):
+    def __init__(self, dim, theta=10000):
         super().__init__()
-        assert (params.dim % 2) == 0
-        self.scale = nn.Parameter(torch.ones(1) * params.dim**-0.5)
+        assert (dim % 2) == 0
+        self.scale = nn.Parameter(torch.ones(1) * dim**-0.5)
 
-        half_dim = params.dim // 2
+        half_dim = dim // 2
         freq_seq = torch.arange(half_dim).float() / half_dim
-        inv_freq = params.theta**-freq_seq
+        inv_freq = theta**-freq_seq
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(self, x, pos=None):
-        seq_len, device = x.shape[1], x.device
+    def forward(self, x=None, pos=None):
 
         if not exists(pos):
+            seq_len, device = x.shape[1], x.device
             pos = torch.arange(seq_len, device=device)
 
-        emb = einsum("i, j -> i j", pos, self.inv_freq)
+        else:
+            device = pos.device
+
+        emb = einsum("i, j -> i j", pos, self.inv_freq.to(device))
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb * self.scale
+        return emb * self.scale.to(device)
 
 
 class AlibiPositionalBias(nn.Module):
-    def __init__(self, params: PositionalEmbeddingParams):
+    def __init__(self, heads, total_heads=None):
         super().__init__()
-        self.heads = params.heads
-        self.total_heads = params.total_heads
+        self.heads = heads
+        self.total_heads = total_heads if total_heads is not None else heads
 
-        slopes = torch.Tensor(self._get_slopes(params.heads))
+        slopes = torch.Tensor(self._get_slopes(heads))
         slopes = rearrange(slopes, "h -> h 1 1")
         self.register_buffer("slopes", slopes, persistent=False)
         self.register_buffer("bias", None, persistent=False)
@@ -174,7 +180,7 @@ class AlibiPositionalBias(nn.Module):
         h, device = self.total_heads, self.device
 
         if exists(self.bias) and self.bias.shape[-1] >= j and self.bias.shape[-2] >= i:
-            return self.bias[..., :i, :j]
+            return self.bias[..., -i:, -j:]
 
         bias = self.get_bias(i, j, device)
         bias = bias * self.slopes
@@ -184,3 +190,52 @@ class AlibiPositionalBias(nn.Module):
         self.register_buffer("bias", bias, persistent=False)
 
         return self.bias
+
+
+class ContinuousPositionBias(nn.Module):
+    """from https://arxiv.org/abs/2111.09883"""
+
+    def __init__(
+        self,
+        *,
+        dim,
+        heads,
+        num_dims=2,  # 2 for images, 3 for video
+        layers=2,
+        log_dist=True,
+        cache_rel_pos=False,
+    ):
+        super().__init__()
+        self.num_dims = num_dims
+        self.log_dist = log_dist
+
+        self.net = nn.ModuleList([])
+        self.net.append(nn.Sequential(nn.Linear(self.num_dims, dim), nn.LeakyReLU(0.1)))
+
+        for _ in range(layers - 1):
+            self.net.append(nn.Sequential(nn.Linear(dim, dim), nn.LeakyReLU(0.1)))
+
+        self.net.append(nn.Linear(dim, heads))
+
+        self.cache_rel_pos = cache_rel_pos
+        self.register_buffer("rel_pos", None, persistent=False)
+
+    def forward(self, *dimensions, device=torch.device("cpu")):
+
+        if not exists(self.rel_pos) or not self.cache_rel_pos:
+            positions = [torch.arange(d, device=device) for d in dimensions]
+            grid = torch.stack(torch.meshgrid(*positions, indexing="ij"))
+            grid = rearrange(grid, "c ... -> (...) c")
+            rel_pos = rearrange(grid, "i c -> i 1 c") - rearrange(grid, "j c -> 1 j c")
+
+            if self.log_dist:
+                rel_pos = torch.sign(rel_pos) * torch.log(rel_pos.abs() + 1)
+
+            self.register_buffer("rel_pos", rel_pos, persistent=False)
+
+        rel_pos = self.rel_pos.float()
+
+        for layer in self.net:
+            rel_pos = layer(rel_pos)
+
+        return rearrange(rel_pos, "i j h -> h i j")

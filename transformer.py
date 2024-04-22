@@ -10,6 +10,8 @@ from utils import default, exists, get_obj_from_str, prob_mask_like
 from einops import rearrange, repeat
 from torch import einsum, nn
 from tqdm.auto import tqdm
+from .positional_embeddings import AlibiPositionalBias, ScaledSinusoidalEmbedding
+from typing import Optional
 
 
 class LayerNorm(nn.Module):
@@ -180,55 +182,65 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, transformer_params: TransformerParams):
+    def __init__(
+        self,
+        dim=256,
+        heads=8,
+        num_tokens=512,
+        max_seq_len=128,
+        add_mask_id=True,
+        emb_dropout=0.0,
+        attn_dropout=0.0,
+        dim_out: Optional[int] = None,
+        depth: int = 12,
+        ff_mult: int = 4,
+        post_emb_norm=False,
+        context_dim: int = 768,
+        rel_pos=False,
+    ):
         super().__init__()
-        self.dim = transformer_params.self_attention_params.dim
-        self.num_tokens = transformer_params.num_tokens
-        self.seq_len = transformer_params.positional_embedding_params.max_seq_len
+        self.dim = dim
+        self.num_tokens = num_tokens
+        self.seq_len = max_seq_len
 
-        self.mask_id = self.num_tokens if transformer_params.add_mask_id else None
+        self.mask_id = self.num_tokens if add_mask_id else None
 
-        self.token_emb = nn.Embedding(
-            self.num_tokens + int(transformer_params.add_mask_id), self.dim
+        self.token_emb = nn.Embedding(self.num_tokens + int(add_mask_id), self.dim)
+
+        if rel_pos:
+            self.pos_emb = AlibiPositionalBias(heads=heads // 2, total_heads=heads)
+            self.is_abs_pos_emb = False
+
+        else:
+            self.pos_emb = ScaledSinusoidalEmbedding(dim=self.dim)
+
+            self.is_abs_pos_emb = True
+
+        self.project_condition = (
+            nn.Linear(context_dim, self.dim, bias=False)
+            if context_dim != self.dim
+            else nn.Identity()
         )
 
-        if transformer_params.positional_embedding_params is None:
-            transformer_params.positional_embedding_params = PositionalEmbeddingParams(
-                dim=self.dim
-            )
-            transformer_params.positional_embedding = PositionalEmbeddingType.SINE
-
-        self.is_abs_pos_emb = transformer_params.positional_embedding.name in [
-            "ABS",
-            "SINE",
-        ]
-
-        self.pos_emb = get_obj_from_str(transformer_params.positional_embedding.value)(
-            transformer_params.positional_embedding_params
-        )
-
-        self.emb_dropout = nn.Dropout(transformer_params.emb_dropout)
+        self.emb_dropout = nn.Dropout(emb_dropout)
 
         self.transformer_blocks = TransformerBlock(
             dim=self.dim,
-            heads=transformer_params.self_attention_params.heads,
-            attn_dropout=transformer_params.self_attention_params.dropout,
-            depth=transformer_params.depth,
-            ff_mult=transformer_params.ff_mult,
+            heads=heads,
+            attn_dropout=attn_dropout,
+            depth=depth,
+            ff_mult=ff_mult,
         )
 
-        self.dim_out = default(transformer_params.dim_out, self.num_tokens)
+        self.dim_out = default(dim_out, self.num_tokens)
         self.to_logits = nn.Linear(self.dim, self.dim_out, bias=False)
 
-        self.post_emb_norm = (
-            nn.LayerNorm(self.dim)
-            if transformer_params.post_emb_norm
-            else nn.Identity()
-        )
+        self.post_emb_norm = nn.LayerNorm(self.dim) if post_emb_norm else nn.Identity()
 
     def prepare_inputs(
         self, x, mask=None, context_embed=None, context_mask=None, cond_drop_prob=0.0
     ):
+
         device, b, n = x.device, *x.shape
 
         if mask is None:
@@ -236,6 +248,7 @@ class Transformer(nn.Module):
 
         # context = self.context_embed_projs[context_type](context_embeds)
         if context_embed is not None and context_mask is None:
+            context_embed = self.project_condition(context_embed)
             context_mask = context_embed != self.mask_id
 
         # classifier free guidance
